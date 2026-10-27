@@ -7,3 +7,13 @@ Each bird follows only its 7 nearest neighbours: it matches their heading, stays
 Controls: how many neighbours each bird watches, flock size (500–5,000), reaction speed, release falcon, pause and reset.
 
 A simplified sketch, not a research model.
+
+Live: https://fsaritome.github.io/starling-murmuration/
+
+## Credits
+
+Created by [fsaritome](https://github.com/fsaritome).
+
+## Copyright
+
+© 2026 fsaritome. All rights reserved. See [LICENSE](LICENSE).
