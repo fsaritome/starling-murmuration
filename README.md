@@ -8,7 +8,9 @@ Each bird follows only its 7 nearest neighbours: it matches their heading, stays
 
 In browsers with WebGPU (current Chrome and Edge, for example) the simulation runs on the GPU. The nearest-neighbour search, the flocking rules and the drawing all happen in compute and render shaders, so the flock starts at 20,000 birds and goes up to 100,000. A "WebGPU" badge appears next to the bird count.
 
-Everywhere else, or if WebGPU fails to start, the page falls back to the original CPU version with 500–5,000 birds. Add `?cpu` to the address to force the CPU version.
+The CPU version always starts at once, and the GPU version takes over as soon as its shaders have compiled, which can take several seconds on a first visit.
+
+Everywhere else, or if WebGPU fails to start, the page stays on the original CPU version with 500–5,000 birds. Add `?cpu` to the address to force the CPU version.
 
 On a desktop with an AMD RDNA 3 GPU, one simulation step took about 1.6 ms for 20,000 birds on the GPU, compared with 11 ms for 5,000 birds on the CPU.
 

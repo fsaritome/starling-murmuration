@@ -391,8 +391,9 @@ function startCPU() {
   }
 
   // ---------- loop ----------
-  let last = performance.now();
+  let last = performance.now(), stopped = false;
   function frame(now) {
+    if (stopped) return;
     requestAnimationFrame(frame);                // schedule first so one bad frame can't stop the loop
     const dt = Math.min(1/30, (now - last) / 1000); last = now;
     if (running) step(dt);
@@ -403,28 +404,31 @@ function startCPU() {
   const fmt = n => n.toLocaleString('en-US');
   const reactWords = ['Sluggish', 'Sluggish', 'Slow', 'Slow', 'Steady', 'Steady', 'Quick', 'Quick', 'Very quick', 'Instant'];
   function readout() { $('readout').textContent = `${fmt(N)} starlings · each watching ${K} neighbour${K === 1 ? '' : 's'}`; }
-  $('k').addEventListener('input', e => { K = +e.target.value; $('kOut').textContent = K; readout(); });
-  $('n').addEventListener('input', e => { setN(+e.target.value); $('nOut').textContent = fmt(N); readout(); });
-  $('react').addEventListener('input', e => { reaction = +e.target.value; $('rOut').textContent = reactWords[reaction - 1]; });
-  $('auto').addEventListener('change', e => { autoFalcon = e.target.checked; nextAuto = 3; });
-  $('falconBtn').addEventListener('click', () => releaseFalcon(null));
-  $('playBtn').addEventListener('click', () => { running = !running; $('playBtn').textContent = running ? 'Pause' : 'Play'; });
-  $('resetBtn').addEventListener('click', reset);
+  const ac = new AbortController(), on = { signal: ac.signal };   // lets the GPU version take over cleanly
+  $('k').addEventListener('input', e => { K = +e.target.value; $('kOut').textContent = K; readout(); }, on);
+  $('n').addEventListener('input', e => { setN(+e.target.value); $('nOut').textContent = fmt(N); readout(); }, on);
+  $('react').addEventListener('input', e => { reaction = +e.target.value; $('rOut').textContent = reactWords[reaction - 1]; }, on);
+  $('auto').addEventListener('change', e => { autoFalcon = e.target.checked; nextAuto = 3; }, on);
+  $('falconBtn').addEventListener('click', () => releaseFalcon(null), on);
+  $('playBtn').addEventListener('click', () => { running = !running; $('playBtn').textContent = running ? 'Pause' : 'Play'; }, on);
+  $('resetBtn').addEventListener('click', reset, on);
   canvas.addEventListener('click', e => {
     const r = canvas.getBoundingClientRect();
     releaseFalcon(unproject(e.clientX - r.left, e.clientY - r.top));
-  });
+  }, on);
 
   if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { running = false; $('playBtn').textContent = 'Play'; }
-  new ResizeObserver(resize).observe(sky);
+  const observer = new ResizeObserver(resize);
+  observer.observe(sky);
   resize();
   reset();
   for (let i = 0; i < 90; i++) step(1/60);       // let the flock settle so the first frame already looks like a flock
   requestAnimationFrame(frame);
+  return () => { stopped = true; ac.abort(); observer.disconnect(); };
 }
 
 // GPU simulation: the same rules, with the neighbour search and drawing on the GPU, so the flock can be far larger.
-async function startGPU() {
+async function startGPU(stopCPU) {
   const $ = id => document.getElementById(id);
   const sky = document.querySelector('.sky');
   if (!navigator.gpu) return false;
@@ -844,7 +848,11 @@ async function startGPU() {
     for (let i = 0; i < 90; i++) { t += 1/60; writeParams(1/60); const enc = device.createCommandEncoder(); encodeStep(enc); device.queue.submit([enc.finish()]); }
   }
 
-  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { running = false; $('playBtn').textContent = 'Play'; }
+  // Take over from the CPU version, keeping whatever the viewer already set.
+  stopCPU();
+  K = +$('k').value; reaction = +$('react').value; autoFalcon = $('auto').checked;
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) running = false;
+  $('playBtn').textContent = running ? 'Pause' : 'Play';
   sky.insertBefore(backdropCanvas, overlayCanvas); sky.insertBefore(gpuCanvas, overlayCanvas);
   Object.assign($('n'), { min: 1000, max: 100000, step: 1000, value: N }); $('nOut').textContent = fmt(N); readout();
   $('engine').hidden = false; $('fearWrap').hidden = false;
@@ -856,8 +864,10 @@ async function startGPU() {
   return true;
 }
 
-// Add ?cpu to the address to force the CPU version.
-(new URLSearchParams(location.search).has('cpu') ? Promise.resolve(false) : startGPU()).then(
-  ok => { if (!ok) startCPU(); },
-  err => { console.warn('WebGPU did not start, using the CPU simulation instead.', err); startCPU(); });
+// The CPU version starts at once. Compiling the GPU shaders can take several seconds on a first visit,
+// so the GPU version takes over only when it is ready. Add ?cpu to the address to stay on the CPU version.
+const stopCPU = startCPU();
+if (!new URLSearchParams(location.search).has('cpu')) {
+  startGPU(stopCPU).catch(err => console.warn('WebGPU did not start, staying on the CPU simulation.', err));
+}
 </script>
