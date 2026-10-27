@@ -29,10 +29,13 @@ html, body { background: var(--paper); color: var(--ink); }
 body { font-family: var(--font-body); font-size: 17px; line-height: 1.55; }
 
 .sky { position: relative; height: clamp(440px, 74vh, 780px); background: linear-gradient(var(--sky-top), var(--sky-mid) 60%, var(--horizon)); overflow: hidden; }
+[hidden] { display: none !important; }
+.sky canvas.layer { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 #c { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; touch-action: manipulation; }
 .caption { position: absolute; top: 0; left: 0; pointer-events: none;
   padding-top: 22px; padding-left: max(20px, env(safe-area-inset-left, 0px)); padding-right: max(20px, env(safe-area-inset-right, 0px)); }
 .caption h1 { margin: 0; font-family: var(--font-display); font-weight: 300; font-style: italic; font-size: clamp(34px, 6vw, 60px); line-height: 1; letter-spacing: -0.01em; text-wrap: balance; }
+.badge { display: inline-block; margin-left: 8px; padding: 2px 6px; border: 1px solid var(--ink); border-radius: 3px; }
 .caption p { margin: 10px 0 0; font-family: var(--font-data); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
 .hint { position: absolute; right: max(16px, env(safe-area-inset-right, 0px)); bottom: 14px; margin: 0; pointer-events: none;
   font-family: var(--font-data); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--paper); opacity: 0.85; }
@@ -78,7 +81,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #f0c9b2; outline-
   <canvas id="c"></canvas>
   <div class="caption">
     <h1>Murmuration</h1>
-    <p id="readout">2,500 starlings · each watching 7 neighbours</p>
+    <p><span id="readout">2,500 starlings · each watching 7 neighbours</span><span class="badge" id="engine" hidden>WebGPU</span></p>
   </div>
   <p class="hint">Tap the sky to send the falcon there</p>
 </section>
@@ -102,6 +105,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #f0c9b2; outline-
       <button id="playBtn" type="button">Pause</button>
       <button id="resetBtn" type="button">Reset</button>
       <label class="check"><input id="auto" type="checkbox" checked> Falcon hunts on its own</label>
+      <label class="check" id="fearWrap" hidden><input id="fear" type="checkbox"> Show fear wave</label>
     </div>
   </div>
 </section>
@@ -135,7 +139,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid #f0c9b2; outline-
 </footer>
 
 <script>
-(() => {
+// CPU simulation: used when WebGPU is missing or fails to start.
+function startCPU() {
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
   const sky = document.querySelector('.sky');
@@ -416,5 +421,443 @@ button:focus-visible, input:focus-visible { outline: 2px solid #f0c9b2; outline-
   reset();
   for (let i = 0; i < 90; i++) step(1/60);       // let the flock settle so the first frame already looks like a flock
   requestAnimationFrame(frame);
-})();
+}
+
+// GPU simulation: the same rules, with the neighbour search and drawing on the GPU, so the flock can be far larger.
+async function startGPU() {
+  const $ = id => document.getElementById(id);
+  const sky = document.querySelector('.sky');
+  if (!navigator.gpu) return false;
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return false;
+  const device = await adapter.requestDevice();
+  // The extra layers stay detached until everything has compiled, so a failure leaves the CPU page untouched.
+  const layer = () => Object.assign(document.createElement('canvas'), { className: 'layer' });
+  const backdropCanvas = layer(), gpuCanvas = layer(), overlayCanvas = $('c');
+
+  const N_MAX = 100000, TBL = 1 << 16, STRIDE = 12;      // bird = pos(xyz, startle), vel(xyz, -), flee(xyz, -)
+  let N = 20000, K = 7, reaction = 7, running = true, autoFalcon = true, showFear = false, t = 0;
+
+  // ---------- shaders ----------
+  const common = /* wgsl */`
+    struct Params { n: u32, k: u32, dt: f32, t: f32,
+                    align: f32, coh: f32, spread: f32, s: f32,
+                    roost: vec4f, falcon: vec4f, view: vec4f, extra: vec4f };
+    struct Bird { pos: vec4f, vel: vec4f, flee: vec4f };
+    const TBL: u32 = ${TBL}u;
+    const MASK: u32 = ${TBL - 1}u;
+  `;
+  const simCode = common + /* wgsl */`
+    @group(0) @binding(0) var<uniform> P: Params;
+    @group(0) @binding(1) var<storage, read> src: array<Bird>;
+    @group(0) @binding(2) var<storage, read_write> dst: array<Bird>;
+    @group(0) @binding(3) var<storage, read_write> cellCount: array<atomic<u32>>;
+    @group(0) @binding(4) var<storage, read_write> cellStart: array<u32>;
+    @group(0) @binding(5) var<storage, read_write> cellFill: array<atomic<u32>>;
+    @group(0) @binding(6) var<storage, read_write> sorted: array<u32>;
+
+    fn cellOf(p: vec3f) -> vec3i { return vec3i(floor(p / (12.0 * P.s))); }
+    fn hcell(c: vec3i) -> u32 {
+      return ((bitcast<u32>(c.x) * 73856093u) ^ (bitcast<u32>(c.y) * 19349663u) ^ (bitcast<u32>(c.z) * 83492791u)) & MASK;
+    }
+
+    @compute @workgroup_size(128) fn count(@builtin(global_invocation_id) g: vec3u) {
+      if (g.x >= P.n) { return; }
+      atomicAdd(&cellCount[hcell(cellOf(src[g.x].pos.xyz))], 1u);
+    }
+
+    var<workgroup> part: array<u32, 256>;
+    @compute @workgroup_size(256) fn scan(@builtin(local_invocation_id) l: vec3u) {
+      let per = TBL / 256u;
+      let base = l.x * per;
+      var s = 0u;
+      for (var c = 0u; c < per; c++) { s += atomicLoad(&cellCount[base + c]); }
+      part[l.x] = s;
+      workgroupBarrier();
+      for (var off = 1u; off < 256u; off *= 2u) {
+        var v = 0u;
+        if (l.x >= off) { v = part[l.x - off]; }
+        workgroupBarrier();
+        part[l.x] += v;
+        workgroupBarrier();
+      }
+      var run = part[l.x] - s;
+      for (var c = 0u; c < per; c++) {
+        cellStart[base + c] = run;
+        atomicStore(&cellFill[base + c], run);
+        run += atomicLoad(&cellCount[base + c]);
+      }
+      if (l.x == 255u) { cellStart[TBL] = part[255]; }
+    }
+
+    @compute @workgroup_size(128) fn scatter(@builtin(global_invocation_id) g: vec3u) {
+      if (g.x >= P.n) { return; }
+      sorted[atomicAdd(&cellFill[hcell(cellOf(src[g.x].pos.xyz))], 1u)] = g.x;
+    }
+
+    var<private> bd: array<f32, 20>;
+    var<private> bi: array<u32, 20>;
+    var<private> cnt: u32;
+    var<private> KK: u32;
+
+    fn consider(j: u32, d2: f32) {
+      var q: u32;
+      if (cnt < KK) { q = cnt; cnt++; }
+      else if (d2 < bd[KK - 1u]) { q = KK - 1u; }
+      else { return; }
+      loop {
+        if (q == 0u || bd[q - 1u] <= d2) { break; }
+        bd[q] = bd[q - 1u]; bi[q] = bi[q - 1u]; q--;
+      }
+      bd[q] = d2; bi[q] = j;
+    }
+
+    fn search(i: u32, p: vec3f, R: i32) {
+      let c = cellOf(p);
+      cnt = 0u;
+      var seen = 0u;
+      for (var dx = -R; dx <= R; dx++) { for (var dy = -R; dy <= R; dy++) { for (var dz = -R; dz <= R; dz++) {
+        let h = hcell(c + vec3i(dx, dy, dz));
+        let en = cellStart[h + 1u];
+        for (var s = cellStart[h]; s < en && seen < 1024u; s++) {
+          let j = sorted[s];
+          if (j == i) { continue; }
+          let e = src[j].pos.xyz - p;
+          consider(j, dot(e, e));
+          seen++;
+        }
+      }}}
+    }
+
+    @compute @workgroup_size(128) fn sim(@builtin(global_invocation_id) g: vec3u) {
+      let i = g.x;
+      if (i >= P.n) { return; }
+      KK = P.k;
+      let b = src[i];
+      let p = b.pos.xyz;
+      let v = b.vel.xyz;
+      search(i, p, 1);
+      if (cnt < KK) { search(i, p, 2); }        // stragglers look further out
+
+      var a = vec3f(0.0);
+      var mp = vec3f(0.0);
+      var mv = vec3f(0.0);
+      var maxS = 0.0;
+      var srcJ = 0xffffffffu;
+      let sepR = 6.0 * P.s;
+      for (var n = 0u; n < cnt; n++) {
+        let o = src[bi[n]];
+        mp += o.pos.xyz; mv += o.vel.xyz;
+        let d = sqrt(bd[n]);
+        if (d < sepR && d > 1e-4) { a += (p - o.pos.xyz) * ((sepR - d) / d * 60.0); }
+        if (o.pos.w > maxS) { maxS = o.pos.w; srcJ = bi[n]; }
+      }
+      if (cnt > 0u) {
+        let inv = 1.0 / f32(cnt);
+        a += (mv * inv - v) * P.align;
+        a += (mp * inv - p) * P.coh;
+      }
+      // roost pull keeps the flock over the field
+      let e = P.roost.xyz - p;
+      let ed = length(e);
+      if (ed > P.roost.w) { let f = (ed - P.roost.w) * 0.35 / ed; a += e * vec3f(f, f * 1.4, f); }
+      if (p.y < -150.0) { a.y += (-150.0 - p.y) * 3.0; }
+
+      // startle: direct threat from the falcon, or passed on from a neighbour
+      var s = maxS * P.spread - 0.004;
+      var fl = vec3f(0.0);
+      if (srcJ != 0xffffffffu) { fl = src[srcJ].flee.xyz; }
+      if (P.falcon.w > 0.5) {
+        let q = p - P.falcon.xyz;
+        let qd = length(q);
+        if (qd < 85.0 && qd > 1e-4) {
+          let th = 1.0 - qd / 85.0;
+          a += q / qd * th * 900.0;
+          if (th > s) { s = th; fl = q / qd * vec3f(1.0, 0.6, 1.0); }
+        }
+      }
+      s = max(s, 0.0);
+      a += fl * s * 260.0;
+      if (cnt > 0u && s > 0.05) { a += (mp / f32(cnt) - p) * s * 3.0; }   // fear tightens the flock
+
+      var nv = v + a * P.dt;
+      nv.y *= 0.995;
+      let sp = max(length(nv), 1e-4);
+      let hi = 92.0 + s * 70.0;
+      nv *= clamp(sp, 55.0, hi) / sp;
+      dst[i] = Bird(vec4f(p + nv * P.dt, s), vec4f(nv, 0.0), vec4f(fl, 0.0));
+    }
+  `;
+  const drawCode = common + /* wgsl */`
+    @group(0) @binding(0) var<uniform> P: Params;
+    @group(0) @binding(1) var<storage, read> birds: array<Bird>;
+    struct VO { @builtin(position) pos: vec4f, @location(0) col: vec4f };
+    @vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+      let b = birds[ii];
+      let w = b.pos.xyz;
+      let pr = 800.0 / (800.0 + w.z);
+      let W = P.view.x; let H = P.view.y; let sc = P.view.z;
+      let sx = W * 0.5 + w.x * pr * sc;
+      let sy = H * 0.55 - w.y * pr * sc;
+      var size = 2.1 * pr * sc * P.view.w;
+      var a = clamp(0.38 + (pr - 0.72) / 0.55 * 0.52, 0.3, 0.92) * P.extra.x;
+      if (size < 1.0) { a *= size; size = 1.0; }    // sub-pixel birds: fade instead of shrinking
+      var corners = array<vec2f, 6>(vec2f(-0.5, -0.4), vec2f(0.5, -0.4), vec2f(-0.5, 0.4),
+                                    vec2f(-0.5, 0.4), vec2f(0.5, -0.4), vec2f(0.5, 0.4));
+      let c = corners[vi] * size;
+      var o: VO;
+      o.pos = vec4f((sx + c.x) / W * 2.0 - 1.0, 1.0 - (sy + c.y) / H * 2.0, 0.0, 1.0);
+      let rgb = mix(vec3f(0.086, 0.106, 0.141), vec3f(0.78, 0.33, 0.14), clamp(b.pos.w * P.extra.y * 1.5, 0.0, 1.0));
+      o.col = vec4f(rgb * a, a);
+      return o;
+    }
+    @fragment fn fs(i: VO) -> @location(0) vec4f { return i.col; }
+  `;
+
+  // ---------- buffers ----------
+  const birdBytes = N_MAX * STRIDE * 4;
+  const bufs = [0, 1].map(() => device.createBuffer({ size: birdBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }));
+  const cellCount = device.createBuffer({ size: TBL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const cellStart = device.createBuffer({ size: (TBL + 1) * 4, usage: GPUBufferUsage.STORAGE });
+  const cellFill = device.createBuffer({ size: TBL * 4, usage: GPUBufferUsage.STORAGE });
+  const sorted = device.createBuffer({ size: N_MAX * 4, usage: GPUBufferUsage.STORAGE });
+  const uni = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const preyBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+  const simLayout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    ...[2, 3, 4, 5, 6].map(binding => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } })),
+  ] });
+  const simModule = device.createShaderModule({ code: simCode });
+  const pl = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
+  const [pCount, pScan, pScatter, pSim] = await Promise.all(['count', 'scan', 'scatter', 'sim'].map(entryPoint =>
+    device.createComputePipelineAsync({ layout: pl, compute: { module: simModule, entryPoint } })));
+  const simGroups = [0, 1].map(c => device.createBindGroup({ layout: simLayout, entries: [
+    { binding: 0, resource: { buffer: uni } }, { binding: 1, resource: { buffer: bufs[c] } }, { binding: 2, resource: { buffer: bufs[c ^ 1] } },
+    { binding: 3, resource: { buffer: cellCount } }, { binding: 4, resource: { buffer: cellStart } },
+    { binding: 5, resource: { buffer: cellFill } }, { binding: 6, resource: { buffer: sorted } },
+  ] }));
+
+  const gctx = gpuCanvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  gctx.configure({ device, format, alphaMode: 'premultiplied' });
+  const drawModule = device.createShaderModule({ code: drawCode });
+  const pDraw = await device.createRenderPipelineAsync({ layout: 'auto',
+    vertex: { module: drawModule, entryPoint: 'vs' },
+    fragment: { module: drawModule, entryPoint: 'fs', targets: [{ format, blend: {
+      color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } } }] },
+    primitive: { topology: 'triangle-list' } });
+  const drawGroups = [0, 1].map(c => device.createBindGroup({ layout: pDraw.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: uni } }, { binding: 1, resource: { buffer: bufs[c] } } ] }));
+  let cur = 0;   // bufs[cur] holds the newest state
+
+  // ---------- flock setup ----------
+  function reset() {
+    const d = new Float32Array(N_MAX * STRIDE);
+    for (let i = 0; i < N_MAX; i++) {
+      const u = Math.random() * Math.PI * 2, v = Math.acos(2 * Math.random() - 1), r = Math.cbrt(Math.random()), o = i * STRIDE;
+      d[o] = -60 + Math.sin(v) * Math.cos(u) * 160 * r; d[o+1] = 30 + Math.cos(v) * 60 * r; d[o+2] = Math.sin(v) * Math.sin(u) * 90 * r;
+      d[o+4] = 70 + Math.random() * 10; d[o+5] = (Math.random() - .5) * 8; d[o+6] = (Math.random() - .5) * 8;
+    }
+    device.queue.writeBuffer(bufs[0], 0, d); device.queue.writeBuffer(bufs[1], 0, d);
+    cur = 0; falcon.active = false; nextAuto = 4; preyPos = null;
+  }
+
+  // ---------- falcon (CPU; reads its prey's position back from the GPU) ----------
+  const falcon = { active: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, aim: null, aimTime: 0, life: 0, retarget: 0 };
+  let nextAuto = 4, preyPos = null, preyIdx = 0, reading = false;
+  function releaseFalcon(target) {
+    if (!falcon.active) {
+      const side = Math.random() < .5 ? -1 : 1;
+      falcon.x = target ? target[0] : side * 520; falcon.y = target ? 300 : 220; falcon.z = (Math.random() - .5) * 100;
+      falcon.vx = target ? 0 : -side * 80; falcon.vy = -60; falcon.vz = 0;
+    }
+    falcon.active = true; falcon.life = 7; falcon.retarget = 0; preyPos = null;
+    falcon.aim = target || null; falcon.aimTime = target ? 1.6 : 0;
+  }
+  function readPrey() {
+    if (reading) return;
+    reading = true;
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(bufs[cur], preyIdx * STRIDE * 4, preyBuf, 0, 16);
+    device.queue.submit([enc.finish()]);
+    preyBuf.mapAsync(GPUMapMode.READ).then(() => {
+      const a = new Float32Array(preyBuf.getMappedRange()); preyPos = [a[0], a[1], a[2]]; preyBuf.unmap(); reading = false;
+    }, () => { reading = false; });
+  }
+  function updateFalcon(dt, roost) {
+    if (!falcon.active) {
+      if (autoFalcon && (nextAuto -= dt) <= 0) { releaseFalcon(null); nextAuto = 9 + Math.random() * 8; }
+      return;
+    }
+    falcon.life -= dt;
+    let tx, ty, tz, spd = 165;
+    if ((falcon.retarget -= dt) <= 0) {
+      if (Math.random() < .25 || preyPos === null) preyIdx = (Math.random() * N) | 0;   // sometimes switch prey
+      falcon.retarget = .3;
+    }
+    readPrey();
+    if (falcon.life <= 0) {
+      tx = falcon.x + falcon.vx * 4; ty = 600; tz = falcon.z; spd = 140;
+      if (falcon.y > 420) falcon.active = false;
+    } else if (falcon.aimTime > 0) {
+      falcon.aimTime -= dt; [tx, ty, tz] = falcon.aim; spd = 210;
+    } else if (preyPos) { [tx, ty, tz] = preyPos; }
+    else { [tx, ty, tz] = roost; }
+    const dx = tx - falcon.x, dy = ty - falcon.y, dz = tz - falcon.z, d = Math.hypot(dx, dy, dz) || 1, k = 2.2 * dt;
+    falcon.vx += (dx/d*spd - falcon.vx) * k; falcon.vy += (dy/d*spd - falcon.vy) * k; falcon.vz += (dz/d*spd - falcon.vz) * k;
+    falcon.x += falcon.vx * dt; falcon.y += falcon.vy * dt; falcon.z += falcon.vz * dt;
+  }
+
+  // ---------- params + one GPU step ----------
+  const pBuf = new ArrayBuffer(96), pF = new Float32Array(pBuf), pU = new Uint32Array(pBuf);
+  let W = 1, H = 1, scale = 1;
+  function writeParams(dt) {
+    const s = Math.cbrt(2500 / N);                       // shrink spacing as the flock grows, so its size on screen stays put
+    pU[0] = N; pU[1] = K; pF[2] = dt; pF[3] = t;
+    pF[4] = 0.6 + reaction * 0.45; pF[5] = 0.5; pF[6] = 0.86 + reaction * 0.012; pF[7] = s;
+    pF[8] = Math.sin(t * .11) * 150; pF[9] = 40 + Math.sin(t * .17) * 45; pF[10] = Math.cos(t * .09) * 90; pF[11] = 150;
+    pF[12] = falcon.x; pF[13] = falcon.y; pF[14] = falcon.z; pF[15] = falcon.active ? 1 : 0;
+    pF[16] = W; pF[17] = H; pF[18] = scale; pF[19] = Math.min(1, Math.max(.45, s * 1.3));
+    pF[20] = Math.min(1, Math.max(.3, Math.sqrt(2500 / N) * 1.6)); pF[21] = showFear ? 1 : 0;
+    device.queue.writeBuffer(uni, 0, pBuf);
+  }
+  function encodeStep(enc) {
+    enc.clearBuffer(cellCount);
+    const pass = enc.beginComputePass();
+    const wg = Math.ceil(N / 128);
+    pass.setBindGroup(0, simGroups[cur]);
+    pass.setPipeline(pCount); pass.dispatchWorkgroups(wg);
+    pass.setPipeline(pScan); pass.dispatchWorkgroups(1);
+    pass.setPipeline(pScatter); pass.dispatchWorkgroups(wg);
+    pass.setPipeline(pSim); pass.dispatchWorkgroups(wg);
+    pass.end();
+    cur ^= 1;
+  }
+  function encodeDraw(enc) {
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view: gctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }] });
+    pass.setPipeline(pDraw); pass.setBindGroup(0, drawGroups[cur]); pass.draw(6, N); pass.end();
+  }
+
+  // ---------- backdrop + falcon overlay (2D) ----------
+  const bctx = backdropCanvas.getContext('2d'), octx = overlayCanvas.getContext('2d');
+  function paintBackdrop(dpr) {
+    const c = backdropCanvas; c.width = W * dpr; c.height = H * dpr;
+    const b = bctx; b.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const css = getComputedStyle(document.documentElement);
+    const g = b.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, css.getPropertyValue('--sky-top')); g.addColorStop(.62, css.getPropertyValue('--sky-mid')); g.addColorStop(1, css.getPropertyValue('--horizon'));
+    b.fillStyle = g; b.fillRect(0, 0, W, H);
+    for (let i = 0; i < 26; i++) {
+      const x = Math.random() * W, y = Math.random() * H * .6, r = 80 + Math.random() * 220;
+      const cg = b.createRadialGradient(x, y, 0, x, y, r);
+      cg.addColorStop(0, 'rgba(236,238,242,0.20)'); cg.addColorStop(1, 'rgba(236,238,242,0)');
+      b.fillStyle = cg; b.beginPath(); b.ellipse(x, y, r * 1.8, r * .45, 0, 0, Math.PI*2); b.fill();
+    }
+    b.fillStyle = css.getPropertyValue('--ink');
+    const base = H - Math.max(14, H * .03);
+    b.fillRect(0, base, W, H - base);
+    let x = -20;
+    while (x < W + 20) {
+      const w = 18 + Math.random() * 70, h = (Math.random() < .25 ? 40 : 14) + Math.random() * H * .07;
+      b.globalAlpha = .85 + Math.random() * .15;
+      for (let k = 0; k < 6; k++) { b.beginPath(); b.ellipse(x + Math.random()*w, base - h*(.4 + Math.random()*.6), w*(.25+Math.random()*.3), h*(.3+Math.random()*.3), 0, 0, Math.PI*2); b.fill(); }
+      b.fillRect(x + w/2 - 1, base - h*.5, 2, h*.5);
+      x += w * (.6 + Math.random() * .5);
+    }
+    b.globalAlpha = 1;
+  }
+  function resize() {
+    const r = sky.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return;
+    W = r.width; H = r.height;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    gpuCanvas.width = W * dpr; gpuCanvas.height = H * dpr;
+    overlayCanvas.width = W * dpr; overlayCanvas.height = H * dpr; octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    scale = Math.min(W / 820, H / 560);
+    paintBackdrop(dpr);
+  }
+  const project = (x, y, z) => { const p = 800 / (800 + z); return [W/2 + x*p*scale, H*0.55 - y*p*scale, p]; };
+  function drawFalcon() {
+    octx.clearRect(0, 0, W, H);
+    if (!falcon.active) return;
+    const [sx, sy, p] = project(falcon.x, falcon.y, falcon.z);
+    const [hx, hy] = project(falcon.x + falcon.vx * .1, falcon.y + falcon.vy * .1, falcon.z + falcon.vz * .1);
+    const s = 9 * p * scale;
+    octx.save(); octx.translate(sx, sy); octx.rotate(Math.atan2(hy - sy, hx - sx));
+    octx.fillStyle = '#5a2c18';
+    octx.beginPath(); octx.moveTo(s * 1.1, 0); octx.quadraticCurveTo(-s*.2, -s*.25, -s*.9, -s*1.3); octx.quadraticCurveTo(-s*.3, -s*.1, -s*1.1, 0);
+    octx.quadraticCurveTo(-s*.3, s*.1, -s*.9, s*1.3); octx.quadraticCurveTo(-s*.2, s*.25, s*1.1, 0); octx.fill();
+    octx.restore();
+  }
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (W < 2) return;
+    const dt = Math.min(1/30, (now - last) / 1000); last = now;
+    const enc = device.createCommandEncoder();
+    if (running) {
+      t += dt;
+      updateFalcon(dt, [pF[8], pF[9], pF[10]]);
+      writeParams(dt);
+      encodeStep(enc);
+    } else writeParams(0);
+    encodeDraw(enc);
+    device.queue.submit([enc.finish()]);
+    drawFalcon();
+  }
+
+  // Bench hook for local testing: GPU time per simulation step at a given flock size.
+  window.__bench = async (n, steps = 60) => {
+    const was = running, prevN = N; running = false; N = n; writeParams(1/60);
+    await device.queue.onSubmittedWorkDone();
+    const enc0 = device.createCommandEncoder(); encodeStep(enc0); device.queue.submit([enc0.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    const s = performance.now();
+    for (let i = 0; i < steps; i++) { const enc = device.createCommandEncoder(); encodeStep(enc); device.queue.submit([enc.finish()]); }
+    await device.queue.onSubmittedWorkDone();
+    const ms = (performance.now() - s) / steps;
+    N = prevN; running = was;
+    return +ms.toFixed(2);
+  };
+
+  // ---------- controls ----------
+  const fmt = n => n.toLocaleString('en-US');
+  const reactWords = ['Sluggish', 'Sluggish', 'Slow', 'Slow', 'Steady', 'Steady', 'Quick', 'Quick', 'Very quick', 'Instant'];
+  const readout = () => { $('readout').textContent = `${fmt(N)} starlings · each watching ${K} neighbour${K === 1 ? '' : 's'}`; };
+  $('k').addEventListener('input', e => { K = +e.target.value; $('kOut').textContent = K; readout(); });
+  $('n').addEventListener('input', e => { N = +e.target.value; $('nOut').textContent = fmt(N); readout(); });
+  $('react').addEventListener('input', e => { reaction = +e.target.value; $('rOut').textContent = reactWords[reaction - 1]; });
+  $('auto').addEventListener('change', e => { autoFalcon = e.target.checked; nextAuto = 3; });
+  $('fear').addEventListener('change', e => { showFear = e.target.checked; });
+  $('falconBtn').addEventListener('click', () => releaseFalcon(null));
+  $('playBtn').addEventListener('click', () => { running = !running; $('playBtn').textContent = running ? 'Pause' : 'Play'; });
+  $('resetBtn').addEventListener('click', () => { reset(); settle(); });
+  overlayCanvas.addEventListener('click', e => {
+    const r = sky.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top;
+    releaseFalcon([(sx - W/2) / scale, -(sy - H*0.55) / scale, 0]);
+  });
+  function settle() {                                   // let the flock form before the first frame
+    for (let i = 0; i < 90; i++) { t += 1/60; writeParams(1/60); const enc = device.createCommandEncoder(); encodeStep(enc); device.queue.submit([enc.finish()]); }
+  }
+
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { running = false; $('playBtn').textContent = 'Play'; }
+  sky.insertBefore(backdropCanvas, overlayCanvas); sky.insertBefore(gpuCanvas, overlayCanvas);
+  Object.assign($('n'), { min: 1000, max: 100000, step: 1000, value: N }); $('nOut').textContent = fmt(N); readout();
+  $('engine').hidden = false; $('fearWrap').hidden = false;
+  new ResizeObserver(resize).observe(sky);
+  resize();
+  reset();
+  settle();
+  requestAnimationFrame(frame);
+  return true;
+}
+
+// Add ?cpu to the address to force the CPU version.
+(new URLSearchParams(location.search).has('cpu') ? Promise.resolve(false) : startGPU()).then(
+  ok => { if (!ok) startCPU(); },
+  err => { console.warn('WebGPU did not start, using the CPU simulation instead.', err); startCPU(); });
 </script>
